@@ -4,6 +4,7 @@ import fhs
 import websocketd
 import os
 import sys
+import base64
 
 # Parse options and prepare machinery for using system files.
 fhs.option('port', 'server port', default = '4567')
@@ -17,19 +18,33 @@ def read_regions(name):
 	'''Read regions definition for a single game.
 	name is the filename for the regions file, in the games directory (without the extension).
 	Returns a dict with int adresses as keys and the initial data (all zero) as values.'''
+	data = open(os.path.join(gamesdir, name + '.regions')).read().split('\n')
+	rom = open(os.path.join(gamesdir, data.pop(0)), 'rb').read()
 	ret = {}
-	for region in open(os.path.join(gamesdir, name + '.regions')).read().split('\n'):
+	for region in data:
+		if len(region.strip()) == 0 or data[0].strip() == '#':
+			continue
 		r = region.split()
+		# Larger than 2 is not a problem; there may be comments after the region definition.
 		if len(r) < 2:
 			continue
 		start = int(r[0], 16)
 		end = int(r[1], 16)
 		# Use (hex) str as key, because json converts keys to str anyway.
 		ret['%04x' % start] = [0] * (end - start + 1)
-	return ret
+	return ret, rom
 
 # Find all supported games and initialize their shared data.
-games = {os.path.splitext(name)[0]: read_regions(os.path.splitext(name)[0]) for name in os.listdir(gamesdir) if os.path.splitext(name)[1] == os.extsep + 'regions'}
+games = {}
+roms = {}
+for name in os.listdir(gamesdir):
+	base, ext = os.path.splitext(name)
+	if ext != os.extsep + 'regions':
+		continue
+	try:
+		games[base], roms[base] = read_regions(base)
+	except FileNotFoundError:
+		print('ignoring game %s, because the rom file cannot be found' % base, file = sys.stderr)
 
 class Connection:
 	'''An instance of this class is created when a new websocket connection is established.
@@ -44,7 +59,7 @@ class Connection:
 		'Remote end calls this to select a game to sync. Returns synced regions, including their current contents.'
 		assert name in games
 		self.gamename = name
-		return games[name]
+		return games[name], base64.b64encode(roms[name]).decode('utf-8')
 	def notify(self, region, data):
 		'''Remote end calls this to report changed data. The entire region is always sent.
 		This function returns None, but also broadcasts the changed data to everyone (including the caller).'''

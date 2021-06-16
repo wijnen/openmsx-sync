@@ -5,12 +5,13 @@ import network
 import websocketd
 import subprocess
 import sys
+import base64
+import time
 import traceback
 
 # Parse options and prepare machinery for using system files.
 fhs.option('game', 'game to sync', default = 'sdsnatcher')
 fhs.option('port', 'port to connect to', default = '4567')
-fhs.option('rom', 'rom file to load', default = 'game.rom')
 config = fhs.init()
 
 def update(region, data):
@@ -36,7 +37,15 @@ class Connection:
 			print('Warning: requested game %s is not defined in the server!' % config['game'], file = sys.stderr)
 			self.gamename = names[0]
 		print('syncing with game %s' % self.gamename, file = sys.stderr)
-		regions = self.remote.game(self.gamename)
+		regions, rom = self.remote.game(self.gamename)
+		romfile = fhs.write_temp(text = False)
+		romfile.write(base64.b64decode(rom.encode('utf-8')))
+		romfile.flush()
+		# Insert cartridge and switch machine on.
+		game.stdin.write(b'<command>carta {%s} ; set power on</command>\n' % romfile.filename.encode('utf-8'))
+		game.stdin.flush()
+		# To be sure the rom is read into memory, wait a moment.
+		time.sleep(1)
 		# Set current data in emulator and add watchpoints for all regions.
 		for r in regions:
 			ir = int(r, 16)
@@ -55,11 +64,11 @@ class Connection:
 g = websocketd.RPC(config['port'], Connection)
 
 # Start openmsx with cartridge and remote control.
-game = subprocess.Popen(('openmsx', '-carta', config['rom'], '-control', 'stdio'), stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.PIPE, close_fds = True)
+game = subprocess.Popen(('openmsx', '-control', 'stdio'), stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.PIPE, close_fds = True)
 game.stdin.write(b'''\
 <openmsx-control>
 <command>set renderer SDL</command>
-<command>set power on</command>''')
+''')
 game.stdin.flush()
 
 # Set up a fifo for incoming data from emulator. Handle data when complete line(s) are received.
