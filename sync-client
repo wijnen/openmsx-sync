@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+
+import fhs
+import network
+import websocketd
+import subprocess
+import sys
+import traceback
+
+# Parse options and prepare machinery for using system files.
+fhs.option('game', 'game to sync', default = 'sdsnatcher')
+fhs.option('port', 'port to connect to', default = '4567')
+fhs.option('rom', 'rom file to load', default = 'game.rom')
+config = fhs.init()
+
+def update(region, data):
+	'The server has reported changed memory. Send the data to the emulator.'
+	# The tcl code needs binary data, but the command string is parsed as utf-8, so encode it as hex and let tcl decode it.
+	game.stdin.write(b'<command>debug write_block "Main RAM" 0x%04x [binary decode hex %s]</command>\n' % (int(region, 16) - 0xc000, b''.join(b'%02x' % x for x in data)))
+	game.stdin.flush()
+
+class Connection:
+	'''This class is similar to the Connection class in the server.
+	However, there is always exactly one instance of this class, which is created when the connection to the server is made.'''
+	def __init__(self, remote):
+		'Store remote socket, so we can send commands to the server.'
+		self.remote = remote
+	def games(self, names):
+		'''The server calls this when the connection is made. In response, an active game should be selected.'''
+		# Regions are stored in a global variable, reachable both from this class and the callbacks from the emulator.
+		global regions
+		if config['game'] in names:
+			self.gamename = config['game']
+		else:
+			# Selected game does not exist. Hopefully there is only one game. Otherwise this is unlikely to work as expected.
+			print('Warning: requested game %s is not defined in the server!' % config['game'], file = sys.stderr)
+			self.gamename = names[0]
+		print('syncing with game %s' % self.gamename, file = sys.stderr)
+		regions = self.remote.game(self.gamename)
+		# Set current data in emulator and add watchpoints for all regions.
+		for r in regions:
+			ir = int(r, 16)
+			r2 = ir + len(regions[r])
+			update(r, regions[r])
+			cmd = b'<command>debug set_watchpoint write_mem {0x%04x 0x%04x} 1 {set data [debug read_block "Main RAM" 0x%04x 0x%04x]; puts stderr "\n%04x\t[binary encode hex $data]"; debug cont}</command>' % (ir, r2, ir - 0xc000, r2 - ir, ir)
+			game.stdin.write(cmd)
+		game.stdin.flush()
+	def update(self, name, region, data):
+		'There is changed data. If this is about our game, send it to the emulator.'
+		if name != self.gamename:
+			return
+		update(region, data)
+
+# Open connection to server.
+g = websocketd.RPC(config['port'], Connection)
+
+# Start openmsx with cartridge and remote control.
+game = subprocess.Popen(('openmsx', '-carta', config['rom'], '-control', 'stdio'), stdin = subprocess.PIPE, stdout = subprocess.PIPE, stderr = subprocess.PIPE, close_fds = True)
+game.stdin.write(b'''\
+<openmsx-control>
+<command>set renderer SDL</command>
+<command>set power on</command>''')
+game.stdin.flush()
+
+# Set up a fifo for incoming data from emulator. Handle data when complete line(s) are received.
+pending = b''
+def my_update(data):
+	global pending
+	pending += data
+	# If a single region is changes multiple times between calls, handle only the last change.
+	actions = {}
+	while b'\n' in pending:
+		line, pending = pending.split(b'\n', 1)
+		# Extra newlines are sent to prevent other messages from messing up the commands.
+		if len(line) == 0:
+			continue
+		try:
+			addr, data = line.split(b'\t')
+			addr = addr.decode('utf-8')
+			assert len(data) == len(regions[addr]) * 2
+			#print('src', data)
+			data = [int(data[2 * t:2 * (t + 1)], 16) for t in range(len(data) // 2)]
+			#print('result', data)
+		except:
+			# Ignore invalid line (all stderr emulator output is parsed).
+			print('ignore', repr(line))
+			#traceback.print_exc()
+			continue
+		actions[addr] = data
+	# Send all changes to server.
+	for a in actions:
+		g.notify(a, actions[a])
+
+# Set stderr output of emulator as event source.
+err = network.wrap(game.stderr)
+err.read(my_update)
+
+# Wait for events (from server or emulator).
+websocketd.fgloop()

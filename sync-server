@@ -1,0 +1,60 @@
+#!/usr/bin/python3
+
+import fhs
+import websocketd
+import os
+import sys
+
+# Parse options and prepare machinery for using system files.
+fhs.option('port', 'server port', default = '4567')
+config = fhs.init(game = True)
+
+# Find directory with region definitions per game.
+# This searches in the current directory and in standard xdg paths.
+gamesdir = fhs.read_data('games', dir = True, opened = False)
+
+def read_regions(name):
+	'''Read regions definition for a single game.
+	name is the filename for the regions file, in the games directory (without the extension).
+	Returns a dict with int adresses as keys and the initial data (all zero) as values.'''
+	ret = {}
+	for region in open(os.path.join(gamesdir, name + '.regions')).read().split('\n'):
+		r = region.split()
+		if len(r) < 2:
+			continue
+		start = int(r[0], 16)
+		end = int(r[1], 16)
+		# Use (hex) str as key, because json converts keys to str anyway.
+		ret['%04x' % start] = [0] * (end - start + 1)
+	return ret
+
+# Find all supported games and initialize their shared data.
+games = {os.path.splitext(name)[0]: read_regions(os.path.splitext(name)[0]) for name in os.listdir(gamesdir) if os.path.splitext(name)[1] == os.extsep + 'regions'}
+
+class Connection:
+	'''An instance of this class is created when a new websocket connection is established.
+	Its only attribute is gamename, the game that is syncing through this connection.
+	Member functions (that don't start with underscore) can be called by the remote end.
+	'''
+	def __init__(self, remote):
+		'Send a list of games. In response the remote end should select a game.'
+		gamename = None
+		remote.games.event(tuple(games.keys()))
+	def game(self, name):
+		'Remote end calls this to select a game to sync. Returns synced regions, including their current contents.'
+		assert name in games
+		self.gamename = name
+		return games[name]
+	def notify(self, region, data):
+		'''Remote end calls this to report changed data. The entire region is always sent.
+		This function returns None, but also broadcasts the changed data to everyone (including the caller).'''
+		assert region in games[self.gamename]
+		assert all(isinstance(x, int) for x in data)
+		assert len(games[self.gamename][region]) == len(data)
+		games[self.gamename][region] = data
+		server.broadcast.update(self.gamename, region, data)
+
+# Start server and wait for events.
+server = websocketd.RPChttpd(config['port'], Connection)
+print('server is running on port %s' % config['port'], file = sys.stderr)
+websocketd.fgloop()
