@@ -1,28 +1,32 @@
 #!/usr/bin/python3
 
+'This is the server part of openmsx-sync. See README.md for details.'
+
 import fhs
 import websocketd
 import os
 import sys
 import base64
+import traceback
 
 # Parse options and prepare machinery for using system files.
 fhs.option('port', 'server port', default = '4567')
 config = fhs.init(game = True)
 
 # Find directory with region definitions per game.
-# This searches in the current directory and in standard xdg paths.
-gamesdir = fhs.read_data('games', dir = True, opened = False)
+# This searches in the current directory and in standard xdg paths and returns a list of all matches.
+gamesdirs = fhs.read_data('games', dir = True, multiple = True)
 
-def read_regions(name):
+def read_regions(gamesdir, name):
 	'''Read regions definition for a single game.
 	name is the filename for the regions file, in the games directory (without the extension).
-	Returns a dict with int adresses as keys and the initial data (all zero) as values.'''
+	Returns a dict with int adresses as keys and the initial data (all zero) as values.
+	Errors are not handled here; they raise an exception which causes the game to be ignored.'''
 	data = open(os.path.join(gamesdir, name + '.regions')).read().split('\n')
 	rom = open(os.path.join(gamesdir, data.pop(0)), 'rb').read()
 	ret = {}
 	for region in data:
-		if len(region.strip()) == 0 or data[0].strip() == '#':
+		if len(region.strip()) == 0 or region.strip().startswith('#'):
 			continue
 		r = region.split()
 		# Larger than 2 is not a problem; there may be comments after the region definition.
@@ -37,14 +41,21 @@ def read_regions(name):
 # Find all supported games and initialize their shared data.
 games = {}
 roms = {}
-for name in os.listdir(gamesdir):
-	base, ext = os.path.splitext(name)
-	if ext != os.extsep + 'regions':
-		continue
-	try:
-		games[base], roms[base] = read_regions(base)
-	except FileNotFoundError:
-		print('ignoring game %s, because the rom file cannot be found' % base, file = sys.stderr)
+for gamesdir in gamesdirs:
+	for name in os.listdir(gamesdir):
+		base, ext = os.path.splitext(name)
+		if base.startswith('.') or ext != os.extsep + 'regions':
+			continue
+		if base in games:
+			print('ignoring duplicate definition of %s' % base)
+			continue
+		try:
+			games[base], roms[base] = read_regions(gamesdir, base)
+		except FileNotFoundError:
+			print('ignoring game %s, because the rom file cannot be found' % base, file = sys.stderr)
+		except:
+			print('ignoring game %s, because there was an error reading the regions file' % base, file = sys.stderr)
+			traceback.print_exc()
 
 class Connection:
 	'''An instance of this class is created when a new websocket connection is established.
